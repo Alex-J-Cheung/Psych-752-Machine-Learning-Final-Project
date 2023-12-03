@@ -1,0 +1,377 @@
+---
+title: "final_exam_23_explanation_cheung"
+author: "Alex Cheung"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(tidymodels) # for modeling
+library(tidyverse) # for general data wrangling
+library(kableExtra) # for displaying formatted tables w/ kbl()
+library(purrr)  # for iteration using map() and walk() variants
+library(janitor)  # for clean_names(), tabyl()
+library(skimr) # for skim()
+library(cowplot) # for plot_grid() and theme_half_open()
+library(corrplot) #for bivariate correlations
+library(iml) # for feature importance, plots, etc
+library(tidyposterior) # for perf_mod()
+library(conflicted) # for package conflicts
+conflicts_prefer(yardstick::rmse)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(broom::bootstrap)
+```
+
+```{r}
+# data files path
+path_final_exam_prediction <- "C:/Users/alexc/Documents/spring_2023_classes/psych_752/week_15"
+```
+
+```{r}
+# fun modeling source
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_modeling.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/print_kbl.R?raw=true")
+```
+
+```{r}
+# plotting theme
+theme_set(theme_half_open())
+```
+
+```{r}
+# parallel processing
+library(doParallel)
+n_core <- detectCores(logical = FALSE)
+if(n_core > 2) {
+  cl <- makePSOCKcluster(n_core - 1)
+  registerDoParallel(cl)
+}
+```
+
+# Cleaning EDA
+
+## 1. Prep Data
+```{r}
+# reading in data and glimpse it
+# tip_percentage is outcome
+# age is focal predictor
+data_all <- read_csv("tips.csv") %>% 
+  clean_names(case = "snake") %>%
+  glimpse()
+```
+
+## 2. Checking for missing values
+```{r}
+# skimming data
+data_all %>% skim_some()
+```
+*We see that there are no missing values for any variables.*
+
+## 3. Exploring Min/Max of Numeric Variables
+```{r}
+data_all %>% 
+  dplyr::select(where(is.numeric)) %>%
+  skim_some()
+```
+*The range of all numeric variables seem to be reasonable.*
+
+## 4. Exploring Responses of Categorical Variables
+```{r}
+data_all %>% 
+  select(where(is.character)) %>% 
+  walk2(.x = names(.), 
+        .y = ., 
+        .f = print_responses)
+```
+*I notice that for the variable day it has unusual observations in it such as "No" and "Yes". I do not know what these are supposed to mean in terms of day of the week, so they are outliers.*
+
+```{r}
+data_all$day[data_all$day %in% c("Yes", "No")] <- "No Information Available"
+```
+*Yes and No in the variable "day" are outliers since they are not a day of the week, so I recoded them both to "No Information Available". I don't think they are necessarily true missing data so I didn't make them into NAs.*
+
+```{r}
+data_all <- data_all |> 
+  mutate(across(where(is.character), tidy_responses)) %>% 
+  glimpse()
+```
+
+```{r}
+data_all %>% 
+  select(where(is.character)) %>% 
+  walk2(.x = names(.), 
+        .y = ., 
+        .f = print_responses)
+```
+*The cleaned response labels look to be understandable and don't need any more changing*
+
+## 5. 
+Train/Test Splits
+```{r}
+set.seed(12345)
+
+splits <- data_all %>%
+  initial_split(prop = 2/3, strata = "tip_percentage")
+
+data_trn <- analysis(splits)
+
+data_test <- assessment(splits)
+```
+*I decided to do a 2/3 split so that the test set would not be small which would result in high variance in exchange for low bias.*
+
+# Modeling EDA
+
+```{r}
+data_trn %>%
+  glimpse()
+```
+
+## Recipe for Modeling EDA 
+```{r}
+rec <- recipe(tip_percentage ~ ., data = data_trn) %>%
+  step_string2factor(all_of(c("customer_sex", "smoker", "day", "time", "server_sex", "any_children", "ordered_dessert")))
+```
+*In the recipe for modeling, I just factorized the character variables in to unordered variables. No need for any levels since they don't seem to ordinal.*
+
+## Make feature matrix for EDA
+```{r}
+feat_trn <- rec %>% 
+  make_features(data_trn, data_trn) %>%
+  glimpse()
+```
+
+## Categorical Variable Distributions
+```{r}
+# univariate
+feat_trn %>% 
+  dplyr::select(where(is.factor)) %>% 
+  names() %>% 
+  map(~ plot_bar(x = .x, data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 4)
+```
+
+```{r}
+# bivariate
+feat_trn %>% 
+  select(where(is.factor)) %>%
+  names() %>%
+  map(~ plot_grouped_box_violin(x = .x, y = "tip_percentage", data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 4) 
+```
+
+## Numeric Variable Distributions
+```{r}
+# univariate 
+feat_trn %>% 
+  select(where(is.numeric)) %>% 
+  names() %>%   
+  map(~ plot_box_violin(x = .x, data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 4)
+```
+
+```{r}
+# bivariate
+feat_trn %>% 
+  select(where(is.numeric) &!tip_percentage) %>% 
+  names() %>%   
+  map(~ plot_scatter(x = .x,y = "tip_percentage", data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 3)
+```
+*We see that there are many outliers. As the total_bill goes up, the tip percentage goes down which is weird because you would expect tip percentage to go up with a higher bill. We see a non-linear relationship with our focal predictor of customer_age and outcome of tip_percentage. I might need to do step_YeoJohnson when I'm creating my recipe to account for these outliers. Let's see what happens when we log transform our focal predictor.*
+
+```{r}
+feat_trn %>%
+  mutate(customer_age = log(customer_age)) |> 
+  plot_scatter("customer_age", "tip_percentage")
+```
+*Log transforming customer_age did not do much to help its relationship with tip_percentage.*
+
+```{r}
+# correlation matrix
+feat_trn %>% 
+  select(where(is.numeric)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  corrplot::corrplot.mixed()
+```
+*The correlations for numeric variables are not that strong. The strongest correlation is total_bill and group_size which is 0.56 which is not that strong in of itself.*
+
+# Fitting a Linear Model Using Cross-Validation
+```{r}
+set.seed(56789)
+
+splits <- data_trn %>% 
+  vfold_cv(v = 10, repeats = 1, strata = "tip_percentage")
+
+splits
+```
+
+```{r}
+# recipe for linear model
+rec_linear <- recipe(tip_percentage ~ ., data = data_trn) %>%
+  step_string2factor(all_nominal_predictors()) %>% 
+  step_YeoJohnson(all_numeric()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_interact(~ customer_age:starts_with("customer_sex")) %>%
+  step_nzv(all_predictors()) 
+```
+*In this recipe for an OLS regression model, I factorized the character variables into unordered factors and I transformed all numeric variables including the outcome since it had outliers. I then normalized all numeric predictors. Dummy coded nominal variables and then created an interaction effect between customer_age and customer_sex to see if sex had any effect on age. I then removed all near zero variance predictors.*
+
+```{r}
+# fitting models
+fits_linear <- linear_reg() %>% 
+  set_engine("lm") %>% 
+  fit_resamples(preprocessor = rec_linear, resamples = splits, metrics = metric_set(rmse))
+```
+
+```{r}
+metrics_kfold_1 <- collect_metrics(fits_linear, summarize = FALSE)
+
+metrics_kfold_1 %>% print_kbl()
+```
+
+```{r}
+metrics_kfold_1 %>% plot_hist(".estimate")
+```
+*We see in this plot that the estimate lies before .5 with an outlier beyond 2.0. That means that the rmse error most is pretty low which is what we desire.*
+
+```{r}
+# rmse error
+collect_metrics(fits_linear, summarize = TRUE)
+```
+
+# Random Forest Model Using Cross-Validation
+```{r}
+# recipe for random model
+rec_rf <- 
+  recipe(tip_percentage ~., data = data_trn) %>%
+  step_string2factor(all_nominal_predictors()) %>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_YeoJohnson(all_numeric()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors())
+
+feat_trn_rf <- rec_rf %>% 
+  make_features(data_trn, data_trn, FALSE)
+```
+*In this recipe, I didn't do anything that different from my first recipe except use step_novel to catch any new levels that were created. Since a random forest model does not need much feature engineering in the recipe, I just did the basics.*
+
+```{r}
+# tuning hyperparameters
+grid_rf <- expand_grid(trees = c(100, 250, 400, 500), mtry = c(1, 4, 8, 10), min_n = c(1, 5, 10, 15))
+```
+*I chose 500 trees as the maximum because I did not want to it to be too computationally expensive and since there only 12 variables, I chose up to 10 of them. I also chose 15 minimum oberservations per node since there didn't seem to be that many noisy predictors in the data.*
+
+```{r}
+# fitting random forest
+fits_rf <-
+    rand_forest(
+      trees = tune(),
+      mtry = tune(),
+      min_n = tune()) %>%
+  set_engine("ranger",
+             respect.unordered.factors = "order",
+             oob.error = FALSE,
+             seed = 102030) %>%
+  set_mode("regression") %>% 
+  tune_grid(preprocessor = rec_rf, 
+            resamples = splits, 
+            grid = grid_rf, 
+            metrics = metric_set(yardstick::rmse))
+```
+
+```{r}
+# plotting random forest
+autoplot(fits_rf)
+```
+*From the plots, we can see that 100 trees has the lowest rmse error of 0.41 so these should be our best hyperparameters to use.*
+
+```{r}
+# showing best model configurations
+show_best(fits_rf)
+```
+*We can see that the random forest model barely outperformed the OLS linear regression model which is surprising, .414 rmse error for random forest and .417 rmse error for OLS. So I will select my random forest model as my best model for evaluation.*
+
+```{r}
+# best model configuration for random forest
+select_best(fits_rf, summarize = TRUE)
+```
+
+```{r}
+# fit random forest mode
+fit_rf <-   
+  rand_forest(trees = select_best(fits_rf)$trees,
+                mtry = select_best(fits_rf)$mtry,
+                min_n = select_best(fits_rf)$min_n) %>%
+  set_engine("ranger", 
+             respect.unordered.factors = "order", 
+             oob.error = FALSE,
+             seed = 102030) %>%
+  set_mode("regression") %>%  
+  fit(tip_percentage ~ ., data = feat_trn_rf)
+```
+
+# Feature Importance for Random Forest
+```{r}
+x <- feat_trn_rf %>% dplyr::select(-tip_percentage)  # x features
+y <- feat_trn_rf %>% dplyr::select(tip_percentage) # outcome
+  
+predictor_rf <- iml::Predictor$new(model = fit_rf, 
+                           data = x, 
+                           y = y)  
+```
+
+```{r}
+imp_rf <- iml::FeatureImp$new(predictor_rf, loss = "rmse")
+
+imp_rf$results %>%   
+  arrange(abs(importance)) %>% 
+  slice_tail(n = 20) %>% 
+  mutate(feature = factor(feature),
+         feature = forcats::fct_inorder(feature)) %>% 
+  ggplot(mapping = aes(x = feature, y = importance)) +
+  geom_point(size = 2, color = "red") +
+  geom_segment(aes(x = feature, y = importance, xend = feature), yend = 0, colour = "grey50")  +
+  ylab("Importance") +
+  coord_flip()
+```
+*What we can see from the feature importance plot is that day has the most importance on the outcome followed by customer age and total bill respectively. So these features are the we should include in our model with customer age being the focal predictor and day and total bill as covariates.*
+
+# Evaluate Best Model in Test
+```{r}
+# feature test matrix
+feat_test <- rec_rf %>% 
+  make_features(data_trn, data_test)
+```
+
+```{r}
+# fit random forest model on full training set
+fit_rf <-   
+  rand_forest(trees = select_best(fits_rf)$trees,
+                mtry = select_best(fits_rf)$mtry,
+                min_n = select_best(fits_rf)$min_n) %>%
+  set_engine("ranger", 
+             respect.unordered.factors = "order", 
+             oob.error = FALSE,
+             seed = 102030) %>%
+  set_mode("regression") %>%  
+  fit(tip_percentage ~ ., data = feat_trn_rf)
+```
+
+```{r}
+# rmse error in test
+rmse_vec(truth = feat_test$tip_percentage, 
+         estimate = predict(fit_rf, feat_test)$.pred)
+```
+*Our rmse error for the random forest model went down when predicting into the held out test set which is really good. That means our model is not overfit to the test set.*
+
+```{r}
+# plotting test set rmse error
+plot_truth(truth = feat_test$tip_percentage, 
+                 estimate = predict(fit_rf, feat_test)$.pred)
+```
+
+# Summary
+*Overall, I considered using an OLS linear regression model and a random forest model because the outcome variable was continuous meaning it was a regression problem. For both models, I had to transform all numeric variables using YeoJohnson including the outcome variable since they all had outliers. For the linear model, I had to dummy code my character variables in order to create an interaction between customer_age and customer_sex. For the random forest model, I just imputed the variables since it can't natively handle missing data. I used cross-validation resampling because it provides an estimate of how well the model is likely to perform on new data and maximizes the use of all data by repeatedly training and evaluating the model on different folds since this data set is small. I chose rmse as my performance metric since I am choosing regression models to fit thus I want to see the amount of error my model has when choosing different features for feature engineering. I believe that the covariates to add are day and total_bill to the model since they have the most importance in the random forest model. Since I used a train/test split to evaluate my model, the benefit is that it provides an estimate of the model's performance on new data. However, I should train the model again on the full dataset but there is no more new data which is a limitation of this evaluation method.*

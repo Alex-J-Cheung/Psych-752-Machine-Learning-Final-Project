@@ -1,0 +1,352 @@
+---
+title: "final_exam_23_prediction_cheung"
+author: "Alex Cheung"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r}
+library(tidymodels) # for modeling
+library(tidyverse) # for general data wrangling
+library(kableExtra) # for displaying formatted tables w/ kbl()
+library(purrr)  # for iteration using map() and walk() variants
+library(janitor)  # for clean_names(), tabyl()
+library(skimr) # for skim()
+library(cowplot) # for plot_grid() and theme_half_open()
+library(corrplot) #for bivariate correlations
+library(conflicted) # for package conflicts
+conflicts_prefer(yardstick::rmse)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(broom::bootstrap)
+```
+
+```{r}
+# data files path
+path_final_exam_prediction <- "C:/Users/alexc/Documents/spring_2023_classes/psych_752/week_15"
+```
+
+```{r}
+# fun modeling source
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/fun_modeling.R?raw=true")
+devtools::source_url("https://github.com/jjcurtin/lab_support/blob/main/print_kbl.R?raw=true")
+```
+
+```{r}
+# plotting theme
+theme_set(theme_half_open())
+```
+
+```{r}
+# parallel processing
+library(doParallel)
+n_core <- detectCores(logical = FALSE)
+if(n_core > 2) {
+  cl <- makePSOCKcluster(n_core - 1)
+  registerDoParallel(cl)
+}
+```
+
+# Cleaning EDA
+
+## 1. Prep Data
+```{r}
+# reading in data and glimpse it
+# satisfaction is outcome variable
+data_all <- read_csv("airline_passenger_satisfaction.csv") %>% 
+  clean_names(case = "snake") %>%
+  glimpse()
+```
+
+## 2. Checking for missing values
+```{r}
+# skimming data
+data_all %>% skim_some()
+```
+*We see that there are missing values in gender and customer_class for character variables. We also see that there are missing values for online_boarding, onboard_service, departure_delay, and arrival_delay for numeric variables*
+
+```{r}
+# looking at missing values of online_boarding
+data_all %>% filter(is.na(online_boarding)) %>%
+  print_kbl()
+```
+
+```{r}
+# looking at missing values for onboard_service
+data_all %>% filter(is.na(onboard_service)) %>%
+  print_kbl()
+```
+ 
+## 3. Exploring Min/Max of Numeric Variables
+```{r}
+data_all %>% 
+  dplyr::select(where(is.numeric)) %>%
+  skim_some()
+```
+*I notice something interesting for online_boarding and onboard_service. If we take a look at online_boarding, the range is from 0-5, but the range for onboard_service is from 1-5. That tells me that the 0 might mean not applicable and that NAs actually are 0s.*
+
+```{r}
+data_all <- data_all %>%
+   mutate(online_boarding = replace_na(online_boarding, 0))
+
+data_all <- data_all %>%
+   mutate(onboard_service = replace_na(onboard_service, 0))
+
+data_all %>% skim_some()
+```
+*I corrected the NAs in online_boarding and onboard_service to 0 because 0 means not applicable following my reasoning in the previous step. I left departure_delay and arrival_delay alone because they seem to be actual missing values*
+
+## 4. Exploring Responses of Categorical Variables
+```{r}
+data_all %>% 
+  select(where(is.character)) %>% 
+  walk2(.x = names(.), 
+        .y = ., 
+        .f = print_responses)
+```
+
+```{r}
+data_all <- data_all |> 
+  mutate(across(where(is.character), tidy_responses)) %>% 
+  glimpse()
+```
+
+```{r}
+data_all %>% 
+  select(where(is.character)) %>% 
+  walk2(.x = names(.), 
+        .y = ., 
+        .f = print_responses)
+```
+*The cleaned response labels look to be understandable and don't need any more changing*
+
+## 5. 
+Train/Test Splits
+```{r}
+set.seed(20110522)
+
+splits <- data_all %>%
+  initial_split(prop = .70, strata = "satisfaction")
+
+data_trn <- analysis(splits)
+
+data_test <- assessment(splits)
+```
+*I decided to do a train/test split of 70% because I felt that a 75% split would leave the test set having too few observations compared to the training set. I felt that it would lead to high variance in my model predictions later on*
+
+# Modeling EDA
+
+```{r}
+data_trn %>%
+  glimpse()
+```
+
+## Recipe for Modeling EDA
+```{r}
+rec <- recipe(satisfaction ~ ., data = data_trn) %>%
+  step_rm(id) %>%
+  step_string2factor(satisfaction, levels = c("neutral_or_dissatisfied", "satisfied")) %>%
+  step_string2factor(all_of(c("gender", "customer_type", "type_of_travel"))) %>%
+  step_string2factor(customer_class, ordered = TRUE, levels = c("eco", "eco_plus", "business")) 
+```
+*In this recipe, I first decided to remove id because it does not have a strong prediction for the outcome and doesn't tell us any meaningful information. I factorized all of the nominal predictors except for customer_class because it seems like it is an ordinal variable with three ordered levels.*
+
+## Make feature matrix for EDA
+```{r}
+feat_trn <- rec %>% 
+  make_features(data_trn, data_trn) %>%
+  glimpse()
+```
+
+## Categorical Variable Distributions
+```{r}
+# univariate
+feat_trn %>% 
+  dplyr::select(where(is.factor)) %>% 
+  names() %>% 
+  map(~ plot_bar(x = .x, data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 4)
+```
+*We can see that for customer_class eco and eco_plus are low frequency categories so I can possibly collapse their levels together. Additionally, the outcome of satisfaction is unbalanced.*
+
+```{r}
+# bivariate
+feat_trn %>% plot_grouped_barplot_count("customer_class", "satisfaction")
+```
+
+```{r}
+feat_trn %>% plot_grouped_barplot_count("customer_type", "satisfaction")
+```
+
+```{r}
+feat_trn %>% plot_grouped_barplot_count("customer_type", "customer_class")
+```
+
+## Numeric Variable Distributions
+```{r}
+# univariate 
+feat_trn %>% 
+  select(where(is.numeric)) %>% 
+  names() %>%   
+  map(~ plot_box_violin(x = .x, data = feat_trn)) %>% 
+  plot_grid(plotlist = ., ncol = 4)
+```
+
+```{r}
+# bivariate
+feat_trn %>% 
+  select(where(is.numeric)) %>% 
+  names() %>% 
+  map(~ plot_grouped_box_violin(data = data_trn, y = .x, x = "satisfaction")) %>% 
+  plot_grid(plotlist = ., ncol = 8)
+```
+
+# Fitting KNN Bootstrap Models
+```{r}
+set.seed (19990125)
+
+splits_boot <- data_trn %>% 
+  bootstraps(times = 100, strata = "satisfaction") 
+
+splits_boot
+```
+*I decided to just a bootstrap resampling method first because I was interested in getting a good baseline accuracy that can be compared later on. I thought that doing a single validation set approach wouldn't really get the best accuracy since this is relatively small dataset and that can cause high variance with a 75/25 split.*
+
+```{r}
+# knn bootstrap recipe
+rec_knn <- recipe(satisfaction ~ ., data = data_trn) %>%
+  step_rm(id) %>%
+  step_string2factor(satisfaction, levels = c("neutral_or_dissatisfied", "satisfied")) %>%
+  step_string2factor(all_of(c("gender", "customer_type", "type_of_travel"))) %>%
+  step_string2factor(customer_class, ordered = TRUE, levels = c("eco", "eco_plus", "business")) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_range(all_numeric_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) 
+```
+*In the knn bootstrap recipe, I again decided to remove id as it does not provide much predictive power. I factorized the outcome variable of satisfaction with satsified being the second level. Addtionally, I factorized all nominal variables into unordered factors since they didn't seem to be in any particular order. However, I made customer_class into an ordinal factor because it made sense that business would be high than both eco and eco plus. I imputed any missing data and range corrected numerical variables since KNN needs to range correct its features. Lastly, I dummy coded all nominal predictors.*
+
+```{r}
+# tuning hyperparamters (neighbors)
+hyper_grid <- expand.grid(neighbors = seq(1, 50, by = 3))
+hyper_grid
+```
+*I tuned this grid to a maximum of 48 neighbors every 4 times because the plot showed that the performance peaked around this number. I now need to tune the neighbors to 30 because a closer look into the graph showed the peak was actually around 30.*
+
+```{r}
+# fitting multiple bootstrap models
+fits_knn_boot <- 
+  nearest_neighbor(neighbors = tune()) %>% 
+    set_engine("kknn") %>% 
+    set_mode("classification") %>%
+    tune_grid(preprocessor = rec_knn, resamples = splits_boot, grid = hyper_grid,
+              metrics = metric_set(accuracy))
+```
+
+```{r}
+collect_metrics(fits_knn_boot, summarize = TRUE)
+```
+
+```{r}
+# plotting performance
+collect_metrics(fits_knn_boot, summarize = TRUE) %>% 
+  ggplot(aes(x = neighbors, y = mean)) +
+    geom_line()
+```
+*As we can see from the plot, we don't need too many neighbors (around 47). The graph starts dipping after the peak around 47 neighbors meaning that as K increases, model bias increases but model variance decreases. However a closer look after tuning the hyperparameters, the peak actually lies around 30, so I will change the tuning grid accordingly.*
+
+```{r}
+# showing 10 best model configurations
+show_best(fits_knn_boot, n = 10)
+```
+
+```{r}
+# showing the best mode configuration
+select_best(fits_knn_boot)
+```
+*The best model configuration was 31 neighbors*
+
+# Fitting GLMnet Model
+```{r}
+# glmnet recipe
+rec_glmnet <-
+  recipe(satisfaction ~ ., data = data_trn) %>%
+  step_rm(id) %>%
+  step_string2factor(satisfaction, levels = c("neutral_or_dissatisfied", "satisfied")) %>%
+  step_string2factor(all_of(c("gender", "customer_type", "type_of_travel"))) %>%
+  step_string2factor(customer_class, ordered = TRUE, levels = c("eco", "eco_plus", "business")) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_YeoJohnson(all_numeric_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+```
+*In the  bootstrap recipe, I again decided to remove id as it does not provide much predictive power. I factorized the outcome variable of satisfaction with satsified being the second level. Addtionally, I factorized all nominal variables into unordered factors since they didn't seem to be in any particular order. However, I made customer_class into an ordinal factor because it made sense that business would be high than both eco and eco plus. I imputed any missing data and range corrected numerical variables since KNN needs to range correct its features. I transformed my numeric variables using YeoJohnson. Lastly, I dummy coded all nominal predictors.*
+
+```{r}
+# tuning grid
+grid_glmnet <- expand_grid(penalty = exp(seq(-3, 1, length.out = 50)),
+                           mixture = seq(0, 1, length.out = 6))
+```
+*I chose these hyperparameters because I wanted the penalty to be large so that the parameter estimates are reducted more. The length_out is 50 so that I can zoom in on the peak of performance, otherwise it would be hard to see.*
+
+```{r}
+# fitting glmnet models
+fits_glmnet <- 
+   logistic_reg(penalty = tune(), 
+             mixture = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification") %>%
+  tune_grid(preprocessor = rec_glmnet, 
+            resamples = splits_boot, grid = grid_glmnet, 
+            metrics = metric_set(accuracy))
+```
+
+```{r}
+# plotting model configurations
+plot_hyperparameters(fits_glmnet, hp1 = "penalty", hp2 = "mixture", metric = "accuracy")
+```
+*The plot shows that accuracy peaks before penalty 1 but I cannot see it clearly, so I will modify my grid to show it more clearly. Now, since I changed the hyperparameters, we can see the peak of performance much more clearly.*
+
+
+```{r}
+# showing 10 best model configurations
+collect_metrics(fits_glmnet, summarize = TRUE, n = 10)
+```
+
+```{r}
+# showing model with best hyperparameters
+select_best(fits_glmnet)
+```
+*Here my best model configuration has a mixture of 0 meaning it is a Ridge regression model*
+
+# Selecting my Best Model
+```{r}
+# creating feature matrices for selecting best model
+feat_trn2 <- rec_knn %>% 
+  make_features(data_trn, data_trn, FALSE)
+
+feat_test <- rec_knn %>% 
+  make_features(data_trn, data_test, FALSE)
+```
+*I decided to evaluate my best model using a train/test split because I wanted to see how it would perform with held out data in the test set.*
+
+```{r}
+# fit best model on full training sample
+fit_knn_best <-
+  nearest_neighbor(neighbors = select_best(fits_knn_boot)$neighbors) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification") %>%
+  fit(satisfaction ~ ., data = feat_trn2)
+```
+
+# Evaluating Best Model
+```{r}
+# prediction accuracy on full test sample
+accuracy_vec(feat_test$satisfaction, predict(fit_knn_best, feat_test)$.pred_class)
+```
+*Accuracy in new data would be .816.*
+
+# Summary
+*During my processing of fitting models, I first decided to create feature training matrix to modeling EDA to get a sense of the relationship between predictor variables and the outcome. For my models, I did a KNN bootstrap resampling algorithm and a logistic regression resampling because they will give me low variance in my model performance compared to a simple independent test set split. The main changes I did to feature engineering was changing one nominal variable to an ordinal variable because it had levels and I felt that the hyperparameters I chose were good enough according to my plots. I chose to evaluate my best model performance which was a KNN bootstrap resampling model in a train/test split because I wanted to see how it would perform in a held out test set. I chose accuracy as my metric because it is a classification model. My model did not perform as well I expected, so maybe another model configuration would be needed for better accuracy in the future.*
